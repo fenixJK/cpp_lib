@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <memory>
 #include <map>
+#include <type_traits>
 
 namespace cpplib {
     class ThreadPool {
@@ -53,7 +54,9 @@ namespace cpplib {
 
         void addThreads(size_t threads) { newThreads(threads); }
 
-        size_t gethreadCount() { return workers.size(); }
+        size_t getThreadCount() const { return workers.size(); }
+        [[deprecated("Use getThreadCount() instead")]]
+        size_t gethreadCount() const { return getThreadCount(); }
 
         ~ThreadPool() {
             {

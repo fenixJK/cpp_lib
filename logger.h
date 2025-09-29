@@ -1,43 +1,57 @@
 #pragma once
 
-#include <iostream>
+#include <chrono>
+#include <cstdint>
+#include <ctime>
 #include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <memory>
 #include <mutex>
 #include <sstream>
+#include <type_traits>
 
 namespace cpplib {
-    enum class LogLevel {
-        TRACE = 1 << 0,
-        DEBUG = 1 << 1,
-        INFO  = 1 << 2,
-        WARN  = 1 << 3,
-        ERROR = 1 << 4,
-        CRITICAL = 1 << 5
+    namespace detail {
+        template <typename Enum>
+        constexpr auto to_underlying(Enum value) noexcept -> std::underlying_type_t<Enum> {
+            return static_cast<std::underlying_type_t<Enum>>(value);
+        }
+    }
+
+    enum class LogLevel : std::uint8_t {
+        TRACE = 0,
+        DEBUG,
+        INFO,
+        WARN,
+        ERROR,
+        CRITICAL
     };
 
-    enum class OutputTarget {
+    constexpr bool operator<(LogLevel lhs, LogLevel rhs) noexcept {
+        return detail::to_underlying(lhs) < detail::to_underlying(rhs);
+    }
+
+    enum class OutputTarget : std::uint8_t {
+        NONE     = 0,
         TERMINAL = 1 << 0,
-        FILE = 1 << 1,
-        GUI = 1 << 2
+        FILE     = 1 << 1,
+        GUI      = 1 << 2
     };
 
-    inline LogLevel operator|(LogLevel lhs, LogLevel rhs) {
-        return static_cast<LogLevel>(static_cast<int>(lhs) | static_cast<int>(rhs));
+    inline OutputTarget operator|(OutputTarget lhs, OutputTarget rhs) noexcept {
+        return static_cast<OutputTarget>(detail::to_underlying(lhs) | detail::to_underlying(rhs));
     }
-    inline LogLevel operator&(LogLevel lhs, LogLevel rhs) {
-        return static_cast<LogLevel>(static_cast<int>(lhs) & static_cast<int>(rhs));
-    }
-    inline OutputTarget operator|(OutputTarget lhs, OutputTarget rhs) {
-        return static_cast<OutputTarget>(static_cast<int>(lhs) | static_cast<int>(rhs));
-    }
-    inline OutputTarget operator&(OutputTarget lhs, OutputTarget rhs) {
-        return static_cast<OutputTarget>(static_cast<int>(lhs) & static_cast<int>(rhs));
+
+    inline OutputTarget operator&(OutputTarget lhs, OutputTarget rhs) noexcept {
+        return static_cast<OutputTarget>(detail::to_underlying(lhs) & detail::to_underlying(rhs));
     }
 
     class Logger {
     public:
         Logger(LogLevel level = LogLevel::INFO, OutputTarget targets = OutputTarget::TERMINAL,
-        const std::string& file = "", bool async = false) : log_level(level), log_targets(targets), Async(async) {
+        const std::string& file = "")
+            : log_level(level), log_targets(targets) {
             if (!file.empty()) {
                 log_file = std::make_unique<std::ofstream>(file, std::ios::app);
             }
@@ -50,10 +64,8 @@ namespace cpplib {
         }
 
         void log(LogLevel level, const std::string& message) {
-            if (isSingleLogLevel(log_level)) {
-                if (level < log_level) return;
-            } else {
-                if (!(static_cast<int>(log_level & level))) return;
+            if (level < log_level) {
+                return;
             }
 
             std::string log_message = "[" + getTimestamp() + "] [" + levelToString(level) + "] " + message;
@@ -84,15 +96,21 @@ namespace cpplib {
         OutputTarget log_targets;
         std::unique_ptr<std::ofstream> log_file;
         std::mutex log_mutex;
-        bool Async;
 
         std::string getTimestamp(bool includeSubsecond = false) {
             auto now = std::chrono::system_clock::now();
             auto time_t_now = std::chrono::system_clock::to_time_t(now);
             auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
 
+            std::tm tm_snapshot{};
+#if defined(_WIN32)
+            localtime_s(&tm_snapshot, &time_t_now);
+#else
+            localtime_r(&time_t_now, &tm_snapshot);
+#endif
+
             std::ostringstream oss;
-            oss << std::put_time(std::localtime(&time_t_now), "%Y-%m-%d %H:%M:%S");
+            oss << std::put_time(&tm_snapshot, "%Y-%m-%d %H:%M:%S");
             if (includeSubsecond) {
                 oss << '.' << std::setfill('0') << std::setw(3) << milliseconds.count();
             }
@@ -112,10 +130,7 @@ namespace cpplib {
         }
 
         inline bool hasTarget(OutputTarget targets, OutputTarget target) {
-            return static_cast<int>(targets & target);
-        }
-        inline bool isSingleLogLevel(LogLevel level) {
-            return (static_cast<int>(level) & (static_cast<int>(level) - 1)) == 0;
+            return detail::to_underlying(targets & target) != 0;
         }
     };
 }
