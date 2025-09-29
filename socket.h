@@ -35,13 +35,17 @@ namespace cpplib {
         bool listen(int backlog = 5);
         std::shared_ptr<Socket> accept();
         bool connect(const std::string& address, int port);
-        bool send(const void* buffer, std::size_t length);
+        std::ptrdiff_t send(const void* buffer, std::size_t length);
         std::ptrdiff_t receive(void* buffer, std::size_t length);
+        std::ptrdiff_t send_all(const void* buffer, std::size_t length);  
+        std::ptrdiff_t recv_exact(void* buffer, std::size_t length);
+        bool set_timeouts(int recv_ms, int send_ms) noexcept;
+        bool wait_readable(int timeout_ms) noexcept;
+        bool wait_writable(int timeout_ms) noexcept;
         void close();
         void shutdown();
         bool valid() const noexcept;
         std::uint16_t localPort() const;
-
     private:
 #if defined(_WIN32) || defined(_WIN64)
         using native_socket_t = SOCKET;
@@ -239,36 +243,26 @@ namespace cpplib {
         return true;
     }
 
-    inline bool Socket::send(const void* buffer, std::size_t length) {
+    inline std::ptrdiff_t Socket::send(const void* buffer, std::size_t length) {
         if (!valid()) {
-            return false;
+            return -1;
         }
-        const char* data = static_cast<const char*>(buffer);
-        std::size_t total_sent = 0;
-
-        while (total_sent < length) {
 #if defined(_WIN32) || defined(_WIN64)
-            const auto sent = ::send(sockfd, data + total_sent,
-                                     static_cast<int>(length - total_sent), 0);
-            if (sent == SOCKET_ERROR) {
-                return false;
-            }
-#else
-            const auto sent = ::send(sockfd, data + total_sent, length - total_sent, 0);
-            if (sent < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                return false;
-            }
-#endif
-            if (sent == 0) {
-                break;
-            }
-            total_sent += static_cast<std::size_t>(sent);
+        int r = ::send(sockfd, static_cast<const char*>(buffer), static_cast<int>(length), 0);
+        if (r == SOCKET_ERROR) {
+            return -1;
         }
-
-        return total_sent == length;
+        return static_cast<std::ptrdiff_t>(r);
+#else
+        for (;;) {
+            ssize_t r = ::send(sockfd, buffer, length, 0);
+            if (r < 0) {
+                if (errno == EINTR) continue; // retry if interrupted
+                return -1;
+            }
+            return static_cast<std::ptrdiff_t>(r);
+        }
+#endif
     }
 
     inline std::ptrdiff_t Socket::receive(void* buffer, std::size_t length) {
@@ -299,6 +293,78 @@ namespace cpplib {
             return received;
 #endif
         }
+    }
+
+    inline std::ptrdiff_t Socket::send_all(const void* buf, std::size_t len) {
+        if (!valid()) return -1;
+        const char* p = static_cast<const char*>(buf);
+        std::size_t sent = 0;
+        while (sent < len) {
+    #if defined(_WIN32)
+            int r = ::send(sockfd, p + sent, (int)(len - sent), 0);
+            if (r == SOCKET_ERROR) return -1;
+    #else
+            ssize_t r = ::send(sockfd, p + sent, len - sent, 0);
+            if (r < 0) { if (errno == EINTR) continue; return -1; }
+    #endif
+            if (r == 0) break;
+            sent += (std::size_t)r;
+        }
+        return (std::ptrdiff_t)sent;
+    }
+
+    inline std::ptrdiff_t Socket::recv_exact(void* buf, std::size_t len) {
+        if (!valid()) return -1;
+        char* p = static_cast<char*>(buf);
+        std::size_t got = 0;
+        while (got < len) {
+    #if defined(_WIN32)
+            int r = ::recv(sockfd, p + got, (int)(len - got), 0);
+            if (r == SOCKET_ERROR) return -1;
+    #else
+            ssize_t r = ::recv(sockfd, p + got, len - got, 0);
+            if (r < 0) { if (errno == EINTR) continue; return -1; }
+    #endif
+            if (r == 0) return 0; // peer closed
+            got += (std::size_t)r;
+        }
+        return (std::ptrdiff_t)got;
+    }
+
+    inline bool Socket::set_timeouts(int rcv_ms, int snd_ms) noexcept {
+        if (!valid()) return false;
+    #if defined(_WIN32)
+        if (rcv_ms >= 0) { DWORD t = rcv_ms; if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&t, sizeof(t))) return false; }
+        if (snd_ms >= 0) { DWORD t = snd_ms; if (setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&t, sizeof(t))) return false; }
+    #else
+        if (rcv_ms >= 0) { timeval tv{ rcv_ms/1000, (rcv_ms%1000)*1000 }; if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv))) return false; }
+        if (snd_ms >= 0) { timeval tv{ snd_ms/1000, (snd_ms%1000)*1000 }; if (setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv))) return false; }
+    #endif
+        return true;
+    }
+    inline bool Socket::wait_readable(int timeout_ms) noexcept {
+    #if defined(_WIN32)
+        WSAPOLLFD p{ sockfd, POLLRDNORM, 0 };
+        int r = WSAPoll(&p, 1, timeout_ms);
+        return r > 0 && (p.revents & (POLLRDNORM | POLLHUP | POLLERR));
+    #else
+        fd_set fds; FD_ZERO(&fds); FD_SET(sockfd, &fds);
+        timeval tv{ timeout_ms/1000, (timeout_ms%1000)*1000 };
+        int r = select(sockfd+1, &fds, nullptr, nullptr, (timeout_ms<0? nullptr: &tv));
+        return r > 0;
+    #endif
+    }
+    inline bool Socket::wait_writable(int timeout_ms) noexcept {
+    #if defined(_WIN32)
+        WSAPOLLFD p{ sockfd, POLLWRNORM, 0 };
+        int r = WSAPoll(&p, 1, timeout_ms);
+        return r > 0 && (p.revents & (POLLWRNORM | POLLERR));
+    #else
+        fd_set fds; FD_ZERO(&fds); FD_SET(sockfd, &fds);
+        timeval tv{ timeout_ms/1000, (timeout_ms%1000)*1000 };
+        int r = select(sockfd+1, nullptr, &fds, nullptr, (timeout_ms<0? nullptr: &tv));
+        return r > 0;
+    #endif
     }
 
     inline void Socket::close() {
