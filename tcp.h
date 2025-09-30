@@ -8,6 +8,8 @@
 #include <thread>
 #include <vector>
 #include <chrono>
+#include <unordered_map>
+#include <mutex>
 #if defined(_WIN32)
   #include <winsock2.h>
   #include <ws2tcpip.h>
@@ -91,7 +93,10 @@ namespace cpplib {
 
     class TcpServer {
     public:
-        using ClientHandler = std::function<void(std::shared_ptr<Socket>)>;
+        using ClientId       = std::uint64_t;
+        using OnConnect      = std::function<void(ClientId, std::shared_ptr<Socket>)>;
+        using MessageHandler = std::function<void(ClientId, std::shared_ptr<Socket>, const char*, std::size_t)>;
+        using OnDisconnect   = std::function<void(ClientId)>;
 
         TcpServer() : running_(false) {}
         ~TcpServer() { stop(); }
@@ -108,11 +113,17 @@ namespace cpplib {
             return listener_.localPort();
         }
 
-        void start(std::size_t workers, ClientHandler handler) {
+        void start(std::size_t workers, MessageHandler on_message) {
+            start(workers, OnConnect{}, std::move(on_message), OnDisconnect{});
+        }
+
+        void start(std::size_t workers, OnConnect on_connect, MessageHandler on_message, OnDisconnect on_disconnect) {
             if (running_.exchange(true)) {
                 return;
             }
-            handler_ = std::move(handler);
+            on_connect_    = std::move(on_connect);
+            on_message_    = std::move(on_message);
+            on_disconnect_ = std::move(on_disconnect);
             pool_ = std::make_unique<ThreadPool>(workers);
             accept_thread_ = std::thread([this] { acceptLoop(); });
         }
@@ -125,12 +136,101 @@ namespace cpplib {
             if (accept_thread_.joinable()) {
                 accept_thread_.join();
             }
+            {
+                std::lock_guard<std::mutex> lk(clients_mtx_);
+                for (auto &kv : clients_) if (kv.second) kv.second->close();
+                clients_.clear();
+            }
             pool_.reset();
         }
 
         bool isRunning() const noexcept { return running_.load(); }
 
+        bool sendTo(ClientId id, const void* data, std::size_t len) {
+            std::shared_ptr<Socket> s;
+            {
+                std::lock_guard<std::mutex> lk(clients_mtx_);
+                auto it = clients_.find(id);
+                if (it == clients_.end()) return false;
+                s = it->second;
+            }
+            return s && (s->send_all(data, len) == static_cast<std::ptrdiff_t>(len));
+        }
+
+        bool sendTextTo(ClientId id, const std::string& text) {
+            return sendTo(id, text.data(), text.size());
+        }
+
+        std::size_t broadcast(const void* data, std::size_t len) {
+            std::vector<std::shared_ptr<Socket>> copy;
+            {
+                std::lock_guard<std::mutex> lk(clients_mtx_);
+                copy.reserve(clients_.size());
+                for (auto &kv : clients_) copy.push_back(kv.second);
+            }
+            std::size_t ok = 0;
+            for (auto &s : copy) if (s && s->send_all(data, len) == static_cast<std::ptrdiff_t>(len)) ++ok;
+            return ok;
+        }
+
+        std::size_t broadcastText(const std::string& text) {
+            return broadcast(text.data(), text.size());
+        }
+
+        std::vector<ClientId> clientIds() const {
+            std::vector<ClientId> ids;
+            std::lock_guard<std::mutex> lk(clients_mtx_);
+            ids.reserve(clients_.size());
+            for (auto &kv : clients_) ids.push_back(kv.first);
+            return ids;
+        }
+
+        bool closeClient(ClientId id) {
+            std::shared_ptr<Socket> s;
+            {
+                std::lock_guard<std::mutex> lk(clients_mtx_);
+                auto it = clients_.find(id);
+                if (it == clients_.end()) return false;
+                s = it->second;
+                clients_.erase(it);
+            }
+            if (s) s->close();
+            return true;
+        }
+
+        std::size_t numClients() const {
+            std::lock_guard<std::mutex> lk(clients_mtx_);
+            return clients_.size();
+        }
+
     private:
+        std::atomic<ClientId> next_id_{1};
+        mutable std::mutex clients_mtx_;
+        std::unordered_map<ClientId, std::shared_ptr<Socket>> clients_;
+        OnConnect on_connect_;
+        MessageHandler on_message_;
+        OnDisconnect on_disconnect_;
+
+        Socket listener_;
+        std::atomic<bool> running_;
+        std::unique_ptr<ThreadPool> pool_;
+        std::thread accept_thread_;
+
+        void handleClient(ClientId id, std::shared_ptr<Socket> client) {
+            // Raw chunked reads; your on_message can parse frames if you use them.
+            char buf[4096];
+            for (;;) {
+                auto r = client->receive(buf, sizeof(buf));
+                if (r <= 0) break; // disconnect or error
+                if (on_message_) on_message_(id, client, buf, static_cast<std::size_t>(r));
+            }
+            if (on_disconnect_) on_disconnect_(id);
+            {
+                std::lock_guard<std::mutex> lk(clients_mtx_);
+                clients_.erase(id);
+            }
+        }
+
         void acceptLoop() {
             while (running_.load()) {
                 auto client = listener_.accept();
@@ -139,16 +239,22 @@ namespace cpplib {
                     continue;
                 }
 
-                if (handler_ && pool_) {
-                    pool_->enqueue(handler_, client);
+                // Assign ID and store
+                ClientId id = next_id_.fetch_add(1, std::memory_order_relaxed);
+                {
+                    std::lock_guard<std::mutex> lk(clients_mtx_);
+                    clients_.emplace(id, client);
+                }
+
+                if (on_connect_) on_connect_(id, client);
+
+                if (pool_) {
+                    pool_->enqueue([this, id, client]{ handleClient(id, client); });
+                } else {
+                    // Fallback: handle inline (not recommended for production)
+                    handleClient(id, client);
                 }
             }
         }
-
-        Socket listener_;
-        std::atomic<bool> running_;
-        std::unique_ptr<ThreadPool> pool_;
-        ClientHandler handler_;
-        std::thread accept_thread_;
     };
 }

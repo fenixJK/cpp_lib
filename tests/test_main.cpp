@@ -77,25 +77,34 @@ namespace {
         auto received_promise = std::make_shared<std::promise<void>>();
         auto received_future = received_promise->get_future();
 
-        server.start(2, [received_promise](std::shared_ptr<cpplib::Socket> client) {
-            char buffer[16] = {0};
-            auto bytes = client->receive(buffer, sizeof(buffer));
-            if (bytes > 0) {
-                const std::string data(buffer, static_cast<std::size_t>(bytes));
-                if (data == "ping") {
-                    const std::string response = "pong";
-                    client->send(response.data(), response.size());
+        server.start(2, [received_promise](cpplib::TcpServer::ClientId /*id*/, std::shared_ptr<cpplib::Socket> client, const char* data, std::size_t len) {
+            // Handle a single message chunk; for this test, "ping" fits in one read.
+            const std::string payload(data, len);
+            if (payload == "ping") {
+                const std::string response = "pong";
+                std::size_t sent = 0;
+                while (sent < response.size()) {
+                    auto n = client->send(response.data() + sent, response.size() - sent);
+                    if (n <= 0) break;
+                    sent += static_cast<std::size_t>(n);
+                }
+                if (sent == response.size()) {
                     received_promise->set_value();
                 }
+                // Close after responding to keep test deterministic
+                client->close();
             }
-            client->shutdown();
-            client->close();
         });
 
         cpplib::TcpClient client;
         expect(client.connect("127.0.0.1", server.port()), "Client connects to server");
         expect(client.send("ping"), "Client sends request");
-        auto reply = client.receive(16);
+        std::string reply; reply.reserve(4);
+        while (reply.size() < 4) {
+            auto chunk = client.receive(4 - reply.size());
+            if (chunk.empty()) break; // peer closed or no data
+            reply += chunk;
+        }
         expect(reply == "pong", "Client receives response");
         client.close();
 
